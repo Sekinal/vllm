@@ -131,6 +131,14 @@ def get_bsz_seq_len(input_ids):
         return shp[:2]
 
 
+# NLLB / M2M-100 require explicit source/target languages. vLLM has no generic
+# slot for this yet, so we read them from the environment (defaulting to the
+# Rosettia spa->quy use case). The source-lang token is prepended to the encoder
+# input; the decoder is started with the target-lang token.
+_NLLB_SRC_LANG = os.getenv("NLLB_SRC_LANG", "spa_Latn")
+_NLLB_TGT_LANG = os.getenv("NLLB_TGT_LANG", "quy_Latn")
+
+
 class M2M100SinusoidalPositionalEmbedding(nn.Module):
     """Fixed (non-learned) sinusoidal positional embeddings, as used by
     M2M-100 / NLLB (HF: ``M2M100SinusoidalPositionalEmbedding``).
@@ -524,20 +532,18 @@ class M2M100EncoderLayer(nn.Module):
         Returns:
             Encoder layer output torch.Tensor
         """
+        # M2M-100/NLLB is PRE-norm: LayerNorm BEFORE each sub-layer, then residual add.
         residual = hidden_states
-        hidden_states = self.self_attn(hidden_states=hidden_states)
-
-        hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states = self.self_attn(hidden_states=hidden_states)
+        hidden_states = residual + hidden_states
 
         residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
         fc1_out, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(fc1_out)
-
         hidden_states, _ = self.fc2(hidden_states)
-
         hidden_states = residual + hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
 
         if hidden_states.dtype == torch.float16 and (
             torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
@@ -614,34 +620,29 @@ class M2M100DecoderLayer(nn.Module):
         Returns:
             Decoder layer output torch.Tensor
         """
-        residual = decoder_hidden_states
-
+        # M2M-100/NLLB is PRE-norm: LayerNorm BEFORE each sub-layer, then residual add.
         # Self Attention
-        hidden_states = self.self_attn(hidden_states=decoder_hidden_states)
-
+        residual = decoder_hidden_states
+        hidden_states = self.self_attn_layer_norm(decoder_hidden_states)
+        hidden_states = self.self_attn(hidden_states=hidden_states)
         hidden_states = residual + hidden_states
-        hidden_states = self.self_attn_layer_norm(hidden_states)
+
         # Cross-Attention Block
-
         residual = hidden_states
-
+        hidden_states = self.encoder_attn_layer_norm(hidden_states)
         hidden_states = self.encoder_attn(
             decoder_hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
         )
-
         hidden_states = residual + hidden_states
-        hidden_states = self.encoder_attn_layer_norm(hidden_states)
 
         # Fully Connected
         residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
         fc1_out, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(fc1_out)
-
         hidden_states, _ = self.fc2(hidden_states)
-
         hidden_states = residual + hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
 
         return hidden_states
 
@@ -721,7 +722,7 @@ class M2M100Encoder(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         embed_pos = self.embed_positions(positions)
-        embed_pos = embed_pos.to(inputs_embeds.device)
+        embed_pos = embed_pos.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
 
         hidden_states = inputs_embeds + embed_pos
 
@@ -813,7 +814,7 @@ class M2M100Decoder(nn.Module):
 
         # embed positions
         embed_pos = self.embed_positions(decoder_positions)
-        embed_pos = embed_pos.to(inputs_embeds.device)
+        embed_pos = embed_pos.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
 
         hidden_states = inputs_embeds + embed_pos
 
@@ -1081,9 +1082,13 @@ class M2M100MultiModalProcessor(EncDecMultiModalProcessor[M2M100ProcessingInfo])
         #   uses encoder_input_ids from mm_kwargs.
         if isinstance(prompt, str) and prompt:
             tokenizer = self.info.get_tokenizer()
+            try:
+                tokenizer.src_lang = _NLLB_SRC_LANG
+            except Exception:
+                pass
             tokens = tokenizer(
                 prompt,
-                add_special_tokens=False,
+                add_special_tokens=True,
                 return_tensors="pt",
             )["input_ids"].flatten()
             return tokens.tolist()
@@ -1127,11 +1132,16 @@ class M2M100MultiModalProcessor(EncDecMultiModalProcessor[M2M100ProcessingInfo])
         if has_encoder_data:
             encoder_texts = mm_data["texts"]
             encoder_text = encoder_texts[0] if encoder_texts else ""
-            # Tokenize the encoder text from mm_data
+            # NLLB/M2M: set src language so the tokenizer prepends the src-lang
+            # token and appends </s> (needs add_special_tokens=True).
+            try:
+                tokenizer.src_lang = _NLLB_SRC_LANG
+            except Exception:
+                pass
             encoder_tokenized = tokenizer(
                 encoder_text,
                 return_tensors="pt",
-                add_special_tokens=False,
+                add_special_tokens=True,
             )
             result["encoder_input_ids"] = encoder_tokenized["input_ids"]
 
@@ -1142,12 +1152,19 @@ class M2M100MultiModalProcessor(EncDecMultiModalProcessor[M2M100ProcessingInfo])
         if isinstance(prompt, (list, tuple)) and len(prompt) > 0 and isinstance(prompt[0], int):
             result["input_ids"] = torch.tensor([prompt])
         else:
-            prompt_tokenized = tokenizer(
-                prompt if prompt else "",
-                return_tensors="pt",
-                **tok_kwargs,
-            )
-            result["input_ids"] = prompt_tokenized["input_ids"]
+            # NLLB/M2M: the decoder must start with [decoder_start, <tgt_lang>].
+            # If the decoder prompt is a language code (e.g. "quy_Latn") map it
+            # to its special-token id; otherwise fall back to the configured tgt.
+            text = (prompt if isinstance(prompt, str) else "").strip()
+            unk = getattr(tokenizer, "unk_token_id", None)
+            lang_id = tokenizer.convert_tokens_to_ids(text) if text else None
+            if lang_id is None or lang_id == unk:
+                lang_id = tokenizer.convert_tokens_to_ids(_NLLB_TGT_LANG)
+            cfg = self.info.get_hf_config()
+            dec_start = getattr(cfg, "decoder_start_token_id", None)
+            if dec_start is None:
+                dec_start = getattr(tokenizer, "eos_token_id", 2)
+            result["input_ids"] = torch.tensor([[dec_start, lang_id]])
 
         return BatchFeature(result)
 
@@ -1188,9 +1205,15 @@ class M2M100MultiModalProcessor(EncDecMultiModalProcessor[M2M100ProcessingInfo])
         text_items = mm_items.get_items("text", TextProcessorItems)
         tokenizer = self.info.get_tokenizer()
 
-        # Tokenize the first text item to get the number of tokens
+        # Tokenize the first text item to get the number of tokens. Must match
+        # the encoder tokenization in _call_hf_processor (NLLB src-lang token +
+        # </s>), so use add_special_tokens=True with the source language set.
         text = text_items.get(0)
-        num_tokens = len(tokenizer.encode(text, add_special_tokens=False))
+        try:
+            tokenizer.src_lang = _NLLB_SRC_LANG
+        except Exception:
+            pass
+        num_tokens = len(tokenizer.encode(text, add_special_tokens=True))
 
         return [
             PromptReplacement(
