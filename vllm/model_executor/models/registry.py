@@ -586,6 +586,7 @@ _MULTIMODAL_MODELS = {
         "NemotronParseForConditionalGeneration",
     ),
     "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),
+    "M2M100ForConditionalGeneration": ("m2m_100", "M2M100ForConditionalGeneration"),  # M2M-100 / NLLB-200 (WIP)
 }
 
 _SPECULATIVE_DECODING_MODELS = {
